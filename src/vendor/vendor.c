@@ -66,21 +66,26 @@
 #include <ccsp_base_api.h>
 #include <dslh_definitions_database.h>
 
+#include <rbus.h>
+#include <rbus_value.h>
+#include <rbuscore.h>
 #include "common_defs.h"
 #include "usp_api.h"
 #include "text_utils.h"
 
-
+#define DM_BYTES 0x00000400
 //-------------------------------------------------------------------------------------------------
 // Handle for connection to DBus
-static void *bus_handle = NULL;
+rbusHandle_t bus_handle = NULL;
 
+bool pam_ready = false;
 //-------------------------------------------------------------------------------------------------
 // Names of components on DBus
 #define CCSP_USPPA_AGENT_PA_SUBSYSTEM           "eRT."
-#define USPPA_COMPONENT_NAME                    "com.bbf.ccsp.usppa"
+#define USPPA_COMPONENT_NAME                    "eRT.com.bbf.ccsp.usppa"
 #define CONF_FILENAME                           "/tmp/ccsp_msg.cfg"
 #define FULL_COMPONENT_REGISTRAR_NAME           CCSP_USPPA_AGENT_PA_SUBSYSTEM CCSP_DBUS_INTERFACE_CR
+
 
 //-------------------------------------------------------------------------------------------------
 // Array containing RDK components which implement the data model
@@ -93,7 +98,6 @@ typedef struct
 
 static rdk_component_t *rdk_components = NULL;
 static int num_rdk_components = 0;
-
 //-------------------------------------------------------------------------------------------------
 // Session ID for RDK component database transactions associated with set, add and delete
 // NOTE: The RDK software components don't accept any value other than 0, and do not support the CcspBaseIf_requestSessionID() API
@@ -111,12 +115,12 @@ int RegisterRdkComponents(char *filename);
 int RegisterRdkParams(char *filename);
 int RegisterRdkObjects(char *filename);
 int TypeStringToUspType(char *rdk_type_str, unsigned *usp_type, int line_number);
-char *RdkTypeToTypeString(enum dataType_e type);
+char *RdkTypeToTypeString(rbusValueType_t type);
 int UspTypeToRdkType(unsigned param_type);
 int CalcIsWritable(char *str, bool *is_writable, int line_number);
 int CalcGroupId(char *group_name);
 bool IsTopLevelObject(char *path);
-char *ToCcspErrString(int ccsp_err);
+char *ToRbusErrString(int rbus_err);
 int RDK_GetEndpointId(char *buf, int len);
 int RDK_AddObject(int group_id, char *path, int *instance);
 int RDK_DeleteObject(int group_id, char *path);
@@ -128,10 +132,10 @@ int RDK_FactoryReset(void);
 int RdkResetInner(char *group_name, char *path, char *value, char *debug_msg);
 int DiscoverDM_Components(char *comps_filename);
 int DiscoverDM_ForAllComponents(char *objs_filename, char *params_filename);
-int DiscoverDM_ForComponent(rdk_component_t *rdkc, kv_vector_t *rdk_objects, kv_vector_t *rdk_params);
-void Add_NameToDM(rdk_component_t *rdkc, char *instantiated_path, char *write_status, kv_vector_t *rdk_objects, kv_vector_t *rdk_params);
-void Add_ObjectToDM(rdk_component_t *rdkc, char *schema_path, char *write_status, kv_vector_t *rdk_objects);
-void Add_ParamToDM(rdk_component_t *rdkc, char *instantiated_path, char *schema_path, char *write_status, kv_vector_t *rdk_params);
+int DiscoverDM_ForComponent(kv_vector_t *rdk_objects, kv_vector_t *rdk_params);
+void Add_NameToDM(const char *group, char *instantiated_path, char *write_status, kv_vector_t *rdk_objects, kv_vector_t *rdk_params);
+void Add_ObjectToDM(const char *group, char *schema_path, char *write_status, kv_vector_t *rdk_objects);
+void Add_ParamToDM(const char *group, char *instantiated_path, char *schema_path, char *write_status, kv_vector_t *rdk_params);
 void ConvertInstantiatedToSchemaPath(char *src, char *dest, int len);
 void AddMissingObjs(kv_vector_t *rdk_objects, kv_vector_t *rdk_params, kv_vector_t *missing_objs);
 int WriteDMConfig(char *filename, char *mode, kv_vector_t *kvv, char *comment);
@@ -141,6 +145,47 @@ void rdk_free(void *ptr);
 #ifdef    INCLUDE_LCM_DATAMODEL
 #include "lcm_rbus_datamodel.c"
 #endif
+/*schedule_diagnostic to pass ConnectivityTestURL datamodel to RdkResetInner */
+int schedule_diagnostic(dm_req_t *req, char *command_key, kv_vector_t *input_args, kv_vector_t *output_args)
+{
+    int err = USP_ERR_OK;
+    USP_LOG_Info("Function called with command_key: %s\n", command_key);
+    err = RdkResetInner("pam", "Device.DeviceInfo.X_RDKCENTRAL-COM_Syndication.RDKB_UIBranding.NetworkDiagnosticTools.ConnectivityTestURL", "www.wikipedia.com", "DIAGNOSTIC");
+    USP_LOG_Info("schedule_diagnostic err = %d \n", err);
+    return err;
+}
+
+/* Command structure contains operate command and its respective function */
+typedef struct
+{
+    char *path;
+    dm_sync_oper_cb_t schedule;
+}Command;
+
+ Command commands[]=
+{
+    {"Device.Diagnostic()",schedule_diagnostic},
+    //ADD MORE OPERATE COMMANDS
+};
+
+#define NUM_COMMANDS (sizeof(commands) / sizeof(commands[0]))
+/* To initialize the operate commands from vendor */
+int VENDOR_USP_REGISTER_Operation()
+{
+    int err = USP_ERR_OK;
+    for (int i=0;i<NUM_COMMANDS;i++)
+    {
+        // for loop placed, to iterate multiple commands 
+        Command selected_command = commands[i];
+        err |= USP_REGISTER_SyncOperation(selected_command.path, selected_command.schedule);
+        if (err!=USP_ERR_OK)
+        {
+            USP_LOG_Info("VENDOR_USP_REGISTER_Operation path = %s failed\n",selected_command.path);
+            break;
+        }
+    }
+    return err;
+}
 
 /*********************************************************************//**
 **
@@ -161,20 +206,17 @@ int VENDOR_Init(void)
     int i;
     int err;
     vendor_hook_cb_t core_callbacks;
-    int ccsp_err;
+    int rbus_err;
     struct stat info;
 
     // Exit if unable to connect to the RDK message bus
     // NOTE: We do this here, rather than in VENDOR_Start() because the SerialNumber, ManufacturerOUI and SoftwareVersion are cached before CCSP_USP_PA_Start() is called
-    ccsp_err = CCSP_Message_Bus_Init((char*)USPPA_COMPONENT_NAME, (char*)CONF_FILENAME, &bus_handle, rdk_malloc, rdk_free);
-    if (ccsp_err != 0)
+    rbus_err = rbus_open(&bus_handle,(char*)USPPA_COMPONENT_NAME);
+    if (rbus_err != 0)
     {
-        USP_ERR_SetMessage("%s: CCSP_Message_Bus_Init() failed (%d - %s)", __FUNCTION__, ccsp_err, ToCcspErrString(ccsp_err));
+        USP_ERR_SetMessage("%s: rbus_open() failed (%d - %s)", __FUNCTION__, rbus_err, ToRbusErrString(rbus_err));
         return USP_ERR_INTERNAL_ERROR;
     }
-
-    // Waits until all RDK components have registered with the system
-    WaitForRdkComponentsReady();
 
     // Create the data model component config file, if it does not already exist
     #define DM_COMPS_FILE  "/etc/usp-pa/usp_dm_comps.conf"
@@ -255,10 +297,15 @@ int VENDOR_Init(void)
     {
         return err;
     }
+    err = VENDOR_USP_REGISTER_Operation();
+    if(err!=USP_ERR_OK)
+    {
+        USP_LOG_Info("VENDOR_USP_REGISTER_Operation failed\n");
+        return err;
+    }
 
     return USP_ERR_OK;
 }
-
 
 /*********************************************************************//**
 **
@@ -301,7 +348,7 @@ int VENDOR_Stop(void)
     // Disconnect from the RDK bus
     if (bus_handle != NULL)
     {
-        CCSP_Message_Bus_Exit(bus_handle);
+        rbus_close(bus_handle);
         bus_handle = NULL;
     }
 
@@ -320,21 +367,59 @@ int VENDOR_Stop(void)
 ** \return  None
 **
 **************************************************************************/
+
+// Pam_Rbus_EventReceiveHandler to receive an event, WaitForRdkComponentsReady uses this in case of subscription to pam
+static void Pam_Rbus_EventReceiveHandler(rbusHandle_t handle, rbusEvent_t const* event, rbusEventSubscription_t* subscription)
+{
+    (void)handle;
+    (void)subscription;
+
+    const char* eventName = event->name;
+
+    if((eventName == NULL))
+    {
+        USP_LOG_Info("%s : FAILED , value is NULL\n",__FUNCTION__);
+        return;
+    }
+    else  if (strcmp(eventName, "pam_ready") == 0)
+    {
+        rbusValue_t valBuff = rbusObject_GetValue(event->data, NULL );
+        USP_LOG_Info("%s %d: change in %s\n", __FUNCTION__, __LINE__, eventName);
+        pam_ready = rbusValue_GetBoolean(valBuff);
+	USP_LOG_Info("%s:%d Received [%s:%d]\n",__FUNCTION__, __LINE__,eventName, pam_ready);
+    }
+    else
+    {
+        USP_LOG_Info("%s:%d Unexpected Event Received [%s]\n",__FUNCTION__, __LINE__,eventName);
+    }
+}
+
 void WaitForRdkComponentsReady(void)
 {
-    int ccsp_err = CCSP_ERR_NOT_CONNECT;
+    int rbus_err = RBUS_ERROR_BUS_ERROR;
     char *paths[1] = { "Device.DeviceInfo.SerialNumber" };
-    int num_values = 0;
-    parameterValStruct_t **values = NULL;
+    rbusValue_t values = NULL;
     int count = 0;
-  
-    while (ccsp_err != CCSP_SUCCESS)
+    char buff[256];
+    while (rbus_err != RBUS_ERROR_SUCCESS)
     {
         // Wait until pam component is running
-        ccsp_err = CcspBaseIf_getParameterValues(bus_handle, "eRT.com.cisco.spvtg.ccsp.pam", "/com/cisco/spvtg/ccsp/pam", paths, NUM_ELEM(paths), &num_values, &values);
-        if (ccsp_err != CCSP_SUCCESS)
+	rbusError_t ret = RBUS_ERROR_SUCCESS;
+	rbusEventSubscription_t subscription = {"pam_ready", NULL, 0, 10, Pam_Rbus_EventReceiveHandler, NULL,NULL, NULL, true};
+	ret = rbusEvent_SubscribeEx(bus_handle, &subscription, 1, 60);
+        if(ret != RBUS_ERROR_SUCCESS)
         {
-            USP_ERR_SetMessage("%s: CcspBaseIf_getParameterValues() failed (%d - %s).", __FUNCTION__, ccsp_err, ToCcspErrString(ccsp_err));
+            USP_LOG_Info("%s %d - Failed to Subscribe %s, Error=%s \n", __FUNCTION__, __LINE__, ToRbusErrString(ret), "pam_ready");
+        }
+        else
+            USP_LOG_Info("%s:%d pam_ready subscribed\n",__FUNCTION__, __LINE__);
+        rbus_err = rbus_get(bus_handle, paths[0], &values);
+        rbusValue_ToDebugString(values, buff, sizeof(buff));
+        USP_LOG_Info("%s : paths[0] is %s: its value : %s\n",__FUNCTION__, paths[0],buff);
+
+        if (rbus_err != RBUS_ERROR_SUCCESS)
+        {
+            USP_ERR_SetMessage("%s: rbus_get() failed (%d - %s).", __FUNCTION__, rbus_err, ToRbusErrString(rbus_err));
 
             // Wait a while, and try again, if the pam component is not running yet
             #define SYSTEM_READY_POLL_PERIOD 10
@@ -345,7 +430,10 @@ void WaitForRdkComponentsReady(void)
     }
 
     // Free the values read
-    free_parameterValStruct_t(bus_handle, num_values, values);
+    if (values != NULL)
+    {
+        rbusValue_Release(values);
+    }
 }
 
 /*********************************************************************//**
@@ -717,6 +805,10 @@ int TypeStringToUspType(char *rdk_type_str, unsigned *usp_type, int line_number)
     {
         *usp_type = DM_ULONG;
     }
+    else if (strcmp(rdk_type_str, "BYTES") == 0)
+    {
+        *usp_type = DM_BYTES;
+    }
     else
     {
         USP_ERR_SetMessage("%s: Type %s not supported at line %d", __FUNCTION__, rdk_type_str, line_number);
@@ -737,61 +829,67 @@ int TypeStringToUspType(char *rdk_type_str, unsigned *usp_type, int line_number)
 ** \return  type string
 **
 **************************************************************************/
-char *RdkTypeToTypeString(enum dataType_e type)
+char *RdkTypeToTypeString(rbusValueType_t type)
 {
-    char *rdk_type_str;
-
+    char *rdk_type_str = "None";
     switch(type)
     {
-        case ccsp_string:
-            rdk_type_str = "STRING";
-            break;
-
-        case ccsp_int:
-        case ccsp_long:
-            rdk_type_str = "INT";
-            break;
-
-        case ccsp_unsignedInt:
-            rdk_type_str = "UINT";
-            break;
-
-        case ccsp_boolean:
+        case RBUS_BOOLEAN:
             rdk_type_str = "BOOL";
             break;
-
-        case ccsp_dateTime:
-            rdk_type_str = "DATETIME";
+        case RBUS_CHAR:
+            rdk_type_str = "CHAR";
             break;
-
-        case ccsp_base64:
-            rdk_type_str = "STRING";
+        case RBUS_BYTE:
+            rdk_type_str = "BYTE";
             break;
-
-        case ccsp_unsignedLong:
+        case RBUS_INT8:
+            rdk_type_str = "INT8";
+            break;
+        case RBUS_UINT8:
+            rdk_type_str = "UINT8";
+            break;
+        case RBUS_INT16:
+            rdk_type_str = "INT16";
+            break;
+        case RBUS_UINT16:
+            rdk_type_str = "INT16";
+            break;
+        case RBUS_INT32:
+            rdk_type_str = "INT";
+            break;
+        case RBUS_UINT32:
+            rdk_type_str = "UINT";
+            break;
+        case RBUS_INT64:
+            rdk_type_str = "LONG";
+            break;
+        case RBUS_UINT64:
             rdk_type_str = "ULONG";
             break;
-
-        case ccsp_float:
-            USP_LOG_Warning("%s: WARNING: ccsp_float not supported. Using STRING", __FUNCTION__);
+        case RBUS_STRING:
             rdk_type_str = "STRING";
             break;
-
-        case ccsp_double:
+        case RBUS_DATETIME:
+            rdk_type_str = "DATETIME";
+            break;
+        case RBUS_BYTES:
+            rdk_type_str = "BYTES";
+            break;
+        case RBUS_SINGLE:
+            USP_LOG_Warning("%s: WARNING: RBUS_SINGLE not supported. Using STRING", __FUNCTION__);
+            rdk_type_str = "STRING";
+            break;
+        case RBUS_DOUBLE:
             USP_LOG_Warning("%s: WARNING: ccsp_double not supported. Using STRING", __FUNCTION__);
             rdk_type_str = "STRING";
             break;
-
-        case ccsp_byte:
-            rdk_type_str = "UINT";
-            break;
-
-        default:
-        case ccsp_none:
-            rdk_type_str = "STRING";
+        case RBUS_PROPERTY:
+        case RBUS_OBJECT:
+        case RBUS_NONE:
+            rdk_type_str = "unknown";
             break;
     }
-
     return rdk_type_str;
 }
 
@@ -810,35 +908,40 @@ int UspTypeToRdkType(unsigned type_flags)
 {
     if (type_flags & DM_STRING)
     {
-        return ccsp_string;
+        return RBUS_STRING;
     }
     else if (type_flags & DM_DATETIME)
     {
-        return ccsp_dateTime;
+        return RBUS_DATETIME;
     }
     else if (type_flags & DM_BOOL)
     {
-        return ccsp_boolean;
+        return RBUS_BOOLEAN;
     }
     else if (type_flags & DM_INT)
     {
-        return ccsp_int;
+        return RBUS_INT32;
     }
     else if (type_flags & DM_UINT)
     {
-        return ccsp_unsignedInt;
+        return RBUS_UINT32;
     }
     else if (type_flags & DM_ULONG)
     {
-        return ccsp_unsignedLong;
+        return RBUS_UINT64;
     }
+    else if (type_flags & DM_BYTES)
+    {
+        return RBUS_BYTES;
+    }
+
     else
     {
         // This assert should only fire if this function is not updated when new types are added to the data model
         USP_ASSERT(false);
     }
 
-    return ccsp_string;
+    return RBUS_STRING;
 }
 
 /*********************************************************************//**
@@ -945,223 +1048,76 @@ bool IsTopLevelObject(char *path)
 
 /*********************************************************************//**
 **
-** ToCcspErrString
+** ToRbusErrString
 **
 ** Converts the given CCSP error code to an error string
 **
-** \param   ccsp_err - ccsp error code
+** \param   rbus_err - ccsp error code
 **
 ** \return  string representing the error
 **
 **************************************************************************/
-char *ToCcspErrString(int ccsp_err)
+char *ToRbusErrString(int rbus_err)
 {
-    char *s;
-
-    switch(ccsp_err)
+    switch(rbus_err)
     {
-        case CCSP_SUCCESS:
-            s = "CCSP_SUCCESS";
-
-        case CCSP_ERR_MEMORY_ALLOC_FAIL:
-            s = "CCSP_ERR_MEMORY_ALLOC_FAIL";
-            break;
-
-        case CCSP_FAILURE:
-            s = "CCSP_FAILURE";
-            break;
-
-        case CCSP_ERR_NOT_CONNECT:
-            s = "CCSP_ERR_NOT_CONNECT - can't connect to daemon";
-            break;
-
-        case CCSP_ERR_TIMEOUT:
-            s = "CCSP_ERR_TIMEOUT";
-            break;
-
-        case CCSP_ERR_NOT_EXIST:
-            s = "CCSP_ERR_NOT_EXIST - remote not exist ";
-            break;
-
-        case CCSP_ERR_NOT_SUPPORT:
-            s = "CCSP_ERR_NOT_SUPPORT - remote can't support this API";
-            break;
-
-        case CCSP_ERR_METHOD_NOT_SUPPORTED:
-            s = "CCSP_ERR_METHOD_NOT_SUPPORTED";
-            break;
-
-        case CCSP_ERR_REQUEST_REJECTED:
-            s = "CCSP_ERR_REQUEST_REJECTED";
-            break;
-
-        case CCSP_ERR_INTERNAL_ERROR:
-            s = "CCSP_ERR_INTERNAL_ERROR";
-            break;
-
-        case CCSP_ERR_INVALID_ARGUMENTS:
-            s = "CCSP_ERR_INVALID_ARGUMENTS";
-            break;
-
-        case CCSP_ERR_RESOURCE_EXCEEDED:
-            s = "CCSP_ERR_RESOURCE_EXCEEDED";
-            break;
-
-        case CCSP_ERR_INVALID_PARAMETER_NAME:
-            s = "CCSP_ERR_INVALID_PARAMETER_NAME";
-            break;
-
-        case CCSP_ERR_INVALID_PARAMETER_TYPE:
-            s = "CCSP_ERR_INVALID_PARAMETER_TYPE";
-            break;
-
-        case CCSP_ERR_INVALID_PARAMETER_VALUE:
-            s = "CCSP_ERR_INVALID_PARAMETER_VALUE";
-            break;
-
-        case CCSP_ERR_NOT_WRITABLE:
-            s = "CCSP_ERR_NOT_WRITABLE";
-            break;
-
-        case CCSP_ERR_SETATTRIBUTE_REJECTED:
-            s = "CCSP_ERR_SETATTRIBUTE_REJECTED";
-            break;
-
-        case CCSP_ERR_FILE_TRANSFER_FAILURE:
-            s = "CCSP_ERR_FILE_TRANSFER_FAILURE";
-            break;
-
-        case CCSP_ERR_UPLOAD_FAILURE:
-            s = "CCSP_ERR_UPLOAD_FAILURE";
-            break;
-
-        case CCSP_ERR_FILE_TRANSFER_AUTH_FAILURE:
-            s = "CCSP_ERR_FILE_TRANSFER_AUTH_FAILURE";
-            break;
-
-        case CCSP_ERR_UNSUPPORTED_PROTOCOL:
-            s = "CCSP_ERR_UNSUPPORTED_PROTOCOL";
-            break;
-
-        case CCSP_ERR_UNABLE_TO_JOIN_MULTICAST:
-            s = "CCSP_ERR_UNABLE_TO_JOIN_MULTICAST";
-            break;
-
-        case CCSP_ERR_UNABLE_TO_CONTACT_FILE_SERVER:
-            s = "CCSP_ERR_UNABLE_TO_CONTACT_FILE_SERVER";
-            break;
-
-        case CCSP_ERR_UNABLE_TO_ACCESS_FILE:
-            s = "CCSP_ERR_UNABLE_TO_ACCESS_FILE";
-            break;
-
-        case CCSP_ERR_UNABLE_TO_COMPLETE_DOWNLOAD:
-            s = "CCSP_ERR_UNABLE_TO_COMPLETE_DOWNLOAD";
-            break;
-
-        case CCSP_ERR_FILE_CORRUPTED_OR_UNUSABLE:
-            s = "CCSP_ERR_FILE_CORRUPTED_OR_UNUSABLE";
-            break;
-
-        case CCSP_ERR_FILE_AUTH_FAILURE:
-            s = "CCSP_ERR_FILE_AUTH_FAILURE";
-            break;
-
-        case CCSP_ERR_UNABLE_TO_COMPLETE_ONTIME:
-            s = "CCSP_ERR_UNABLE_TO_COMPLETE_ONTIME";
-            break;
-
-        case CCSP_ERR_CANCELATION_NOT_PERMITTED:
-            s = "CCSP_ERR_CANCELATION_NOT_PERMITTED";
-            break;
-
-        case CCSP_ERR_INVALID_UUID_FORMAT:
-            s = "CCSP_ERR_INVALID_UUID_FORMAT";
-            break;
-
-        case CCSP_ERR_UNKNOWN_EE:
-            s = "CCSP_ERR_UNKNOWN_EE";
-            break;
-
-        case CCSP_ERR_DISABLED_EE:
-            s = "CCSP_ERR_DISABLED_EE";
-            break;
-
-        case CCSP_ERR_DU_EE_MISMATCH:
-            s = "CCSP_ERR_DU_EE_MISMATCH";
-            break;
-
-        case CCSP_ERR_DUPLICATE_DU:
-            s = "CCSP_ERR_DUPLICATE_DU";
-            break;
-
-        case CCSP_ERR_SYSTEM_RES_EXCEEDED:
-            s = "CCSP_ERR_SYSTEM_RES_EXCEEDED";
-            break;
-
-        case CCSP_ERR_UNKNOWN_DU:
-            s = "CCSP_ERR_UNKNOWN_DU";
-            break;
-
-        case CCSP_ERR_INVALID_DU_STATE:
-            s = "CCSP_ERR_INVALID_DU_STATE";
-            break;
-
-        case CCSP_ERR_DOWNGRADE_NOT_PERMITTED:
-            s = "CCSP_ERR_DOWNGRADE_NOT_PERMITTED";
-            break;
-
-        case CCSP_ERR_VERSION_NOT_SPECIFIED:
-            s = "CCSP_ERR_VERSION_NOT_SPECIFIED";
-            break;
-
-        case CCSP_ERR_VERSION_EXISTS:
-            s = "CCSP_ERR_VERSION_EXISTS";
-            break;
-
-        case CCSP_CR_ERR_NAMESPACE_OVERLAP:
-            s = "CCSP_CR_ERR_NAMESPACE_OVERLAP";
-            break;
-
-        case CCSP_CR_ERR_UNKNOWN_COMPONENT:
-            s = "CCSP_CR_ERR_UNKNOWN_COMPONENT";
-            break;
-
-        case CCSP_CR_ERR_NAMESPACE_MISMATCH:
-            s = "CCSP_CR_ERR_NAMESPACE_MISMATCH";
-            break;
-
-        case CCSP_CR_ERR_UNSUPPORTED_NAMESPACE:
-            s = "CCSP_CR_ERR_UNSUPPORTED_NAMESPACE";
-            break;
-
-        case CCSP_CR_ERR_DP_COMPONENT_VERSION_MISMATCH:
-            s = "CCSP_CR_ERR_DP_COMPONENT_VERSION_MISMATCH";
-            break;
-
-        case CCSP_CR_ERR_INVALID_PARAM:
-            s = "CCSP_CR_ERR_INVALID_PARAM";
-            break;
-
-        case CCSP_CR_ERR_UNSUPPORTED_DATATYPE:
-            s = "CCSP_CR_ERR_UNSUPPORTED_DATATYPE";
-            break;
-
-        case CCSP_CR_ERR_SESSION_IN_PROGRESS:
-            s = "CCSP_CR_ERR_SESSION_IN_PROGRESS";
-            break;
-
-        case CCSP_INVALID_PSMCLI_CMD:
-            s = "CCSP_INVALID_PSMCLI_CMD";
-            break;
-
+        case RBUS_ERROR_SUCCESS:
+            return "RBUS_ERROR_SUCCESS";
+        case RBUS_ERROR_BUS_ERROR:
+            return "RBUS_ERROR_BUS_ERROR";
+        case RBUS_ERROR_INVALID_INPUT:
+            return "RBUS_ERROR_INVALID_INPUT";
+        case RBUS_ERROR_NOT_INITIALIZED:
+            return "RBUS_ERROR_NOT_INITIALIZED";
+        case RBUS_ERROR_OUT_OF_RESOURCES:
+            return "RBUS_ERROR_OUT_OF_RESOURCES";
+        case RBUS_ERROR_DESTINATION_NOT_FOUND:
+            return "RBUS_ERROR_DESTINATION_NOT_FOUND";
+        case RBUS_ERROR_DESTINATION_NOT_REACHABLE:
+            return "RBUS_ERROR_DESTINATION_NOT_REACHABLE";
+        case RBUS_ERROR_DESTINATION_RESPONSE_FAILURE:
+            return "RBUS_ERROR_DESTINATION_RESPONSE_FAILURE";
+        case RBUS_ERROR_INVALID_RESPONSE_FROM_DESTINATION:
+            return "RBUS_ERROR_INVALID_RESPONSE_FROM_DESTINATION";
+        case RBUS_ERROR_INVALID_OPERATION:
+            return "RBUS_ERROR_INVALID_OPERATION";
+        case RBUS_ERROR_INVALID_EVENT:
+            return "RBUS_ERROR_INVALID_EVENT";
+        case RBUS_ERROR_INVALID_HANDLE:
+            return "RBUS_ERROR_INVALID_HANDLE";
+        case RBUS_ERROR_SESSION_ALREADY_EXIST:
+            return "RBUS_ERROR_SESSION_ALREADY_EXIST";
+        case RBUS_ERROR_COMPONENT_NAME_DUPLICATE:
+            return "RBUS_ERROR_COMPONENT_NAME_DUPLICATE";
+        case RBUS_ERROR_ELEMENT_NAME_DUPLICATE:
+            return "RBUS_ERROR_ELEMENT_NAME_DUPLICATE";
+        case RBUS_ERROR_ELEMENT_NAME_MISSING:
+            return "RBUS_ERROR_ELEMENT_NAME_MISSING";
+        case RBUS_ERROR_COMPONENT_DOES_NOT_EXIST:
+            return "RBUS_ERROR_COMPONENT_DOES_NOT_EXIST";
+        case RBUS_ERROR_ELEMENT_DOES_NOT_EXIST:
+            return "RBUS_ERROR_ELEMENT_DOES_NOT_EXIST";
+        case RBUS_ERROR_ACCESS_NOT_ALLOWED:
+            return "RBUS_ERROR_ACCESS_NOT_ALLOWED";
+        case RBUS_ERROR_INVALID_CONTEXT:
+            return "RBUS_ERROR_INVALID_CONTEXT";
+        case RBUS_ERROR_TIMEOUT:
+            return "RBUS_ERROR_TIMEOUT";
+        case RBUS_ERROR_ASYNC_RESPONSE:
+            return "RBUS_ERROR_ASYNC_RESPONSE";
+        case RBUS_ERROR_INVALID_METHOD:
+            return "RBUS_ERROR_INVALID_METHOD";
+        case RBUS_ERROR_NOSUBSCRIBERS:
+            return "RBUS_ERROR_NOSUBSCRIBERS";
+        case RBUS_ERROR_SUBSCRIPTION_ALREADY_EXIST:
+            return "RBUS_ERROR_SUBSCRIPTION_ALREADY_EXIST";
+        case RBUS_ERROR_INVALID_NAMESPACE:
+            return "RBUS_ERROR_INVALID_NAMESPACE";
+        case RBUS_ERROR_DIRECT_CON_NOT_EXIST:
+            return "RBUS_ERROR_DIRECT_CON_NOT_EXIST";
         default:
-            s = "unknown CCSP error";
-            break;
-
+            return "unknown RBUS error";
     }
-
-    return s;
 }
 
 /*********************************************************************//**
@@ -1274,14 +1230,13 @@ exit:
 **************************************************************************/
 int RDK_AddObject(int group_id, char *path, int *instance)
 {
-    int ccsp_err;
+    int rbus_err;
     char buf[MAX_DM_PATH];
-    rdk_component_t *rdkc;
 
     // Exit if this function is called before D-Bus has been connected to
     if (bus_handle == NULL)
     {
-        USP_ERR_SetMessage("%s: called before connected to D-Bus", __FUNCTION__);
+        USP_ERR_SetMessage("%s: called before connected to R-Bus", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
@@ -1289,11 +1244,11 @@ int RDK_AddObject(int group_id, char *path, int *instance)
     USP_SNPRINTF(buf, sizeof(buf), "%s.", path);
 
     // Exit if the add failed
-    rdkc = &rdk_components[group_id];
-    ccsp_err = CcspBaseIf_AddTblRow(bus_handle, rdkc->component_name, rdkc->dbus_path, RDK_SESSION_ID, buf, instance);
-    if (ccsp_err != CCSP_SUCCESS)
+    rbus_err = rbusTable_addRow(bus_handle,buf, NULL, (uint32_t *)instance);
+
+    if (rbus_err != RBUS_ERROR_SUCCESS)
     {
-        USP_ERR_SetMessage("%s: CcspBaseIf_AddTblRow(%s) failed (%d - %s)", __FUNCTION__, buf, ccsp_err, ToCcspErrString(ccsp_err));
+        USP_ERR_SetMessage("%s: rbusTable_addRow(%s) failed (%d - %s)", __FUNCTION__, buf, rbus_err, ToRbusErrString(rbus_err));
         return USP_ERR_CREATION_FAILURE;
     }
 
@@ -1314,14 +1269,13 @@ int RDK_AddObject(int group_id, char *path, int *instance)
 **************************************************************************/
 int RDK_DeleteObject(int group_id, char *path)
 {
-    int ccsp_err;
+    int rbus_err;
     char buf[MAX_DM_PATH];
-    rdk_component_t *rdkc;
 
-    // Exit if this function is called before D-Bus has been connected to
+    // Exit if this function is called before R-Bus has been connected to
     if (bus_handle == NULL)
     {
-        USP_ERR_SetMessage("%s: called before connected to D-Bus", __FUNCTION__);
+        USP_ERR_SetMessage("%s: called before connected to R-Bus", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
@@ -1329,11 +1283,11 @@ int RDK_DeleteObject(int group_id, char *path)
     USP_SNPRINTF(buf, sizeof(buf), "%s.", path);
 
     // Exit if the delete failed
-    rdkc = &rdk_components[group_id];
-    ccsp_err = CcspBaseIf_DeleteTblRow(bus_handle, rdkc->component_name, rdkc->dbus_path, RDK_SESSION_ID, buf);
-    if (ccsp_err != CCSP_SUCCESS)
+    rbus_err = rbusTable_removeRow(bus_handle,buf);
+
+    if (rbus_err != RBUS_ERROR_SUCCESS)
     {
-        USP_ERR_SetMessage("%s: CcspBaseIf_DeleteTblRow(%s) failed (%d - %s)", __FUNCTION__, buf, ccsp_err, ToCcspErrString(ccsp_err));
+        USP_ERR_SetMessage("%s: CcspBaseIf_DeleteTblRow(%s) failed (%d - %s)", __FUNCTION__, buf, rbus_err, ToRbusErrString(rbus_err));
         return USP_ERR_OBJECT_NOT_DELETABLE;
     }
 
@@ -1355,28 +1309,26 @@ int RDK_DeleteObject(int group_id, char *path)
 int RDK_GetGroup(int group_id, kv_vector_t *params)
 {
     int i;
-    int ccsp_err;
-    char **paths = NULL;
-    rdk_component_t *rdkc;
+    int rbus_err;
+    char const **paths = NULL;
     int num_values = 0;
-    parameterValStruct_t **values = NULL;
-    parameterValStruct_t *val;
+    rbusProperty_t value = NULL;
+    rbusProperty_t next = NULL;
     int err = USP_ERR_OK;
 
     // Exit if this function is called before D-Bus has been connected to
     if (bus_handle == NULL)
     {
-        USP_ERR_SetMessage("%s: called before connected to D-Bus", __FUNCTION__);
+        USP_ERR_SetMessage("%s: called before connected to R-Bus", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
     // Copy the paths of the parameters to get into the paths array
-    paths = USP_MALLOC((params->num_entries)*sizeof(char*));
+    paths = (char const **)USP_MALLOC((params->num_entries)*sizeof(char*));
     for (i=0; i < params->num_entries; i++)
     {
         paths[i] = params->vector[i].key;
     }
-
 
 // Uncomment the following define if you want to log the amount of time taken to perform the group get for this component
 //#define LOG_RDK_GET_TIME
@@ -1387,9 +1339,7 @@ int RDK_GetGroup(int group_id, kv_vector_t *params)
 #endif
 
     // Get the group of parameters provided by this software component
-    rdkc = &rdk_components[group_id];
-    ccsp_err = CcspBaseIf_getParameterValues(bus_handle, rdkc->component_name, rdkc->dbus_path, paths, params->num_entries, &num_values, &values);
-
+    rbus_err = rbus_getExt(bus_handle,params->num_entries, paths, &num_values, &value);
 #ifdef LOG_RDK_GET_TIME
     gettimeofday(&tv, NULL);
     double finish_time = (double)tv.tv_sec + (double)tv.tv_usec/(double)1000000.0;
@@ -1398,25 +1348,29 @@ int RDK_GetGroup(int group_id, kv_vector_t *params)
 #endif
 
     // Exit if unable to get the parameters
-    if (ccsp_err != CCSP_SUCCESS)
+    if (rbus_err != RBUS_ERROR_SUCCESS)
     {
-        USP_ERR_SetMessage("%s: CcspBaseIf_getParameterValues() failed (%d - %s)", __FUNCTION__, ccsp_err, ToCcspErrString(ccsp_err));
+        USP_ERR_SetMessage("%s: rbus_get() failed (%d - %s)", __FUNCTION__, rbus_err, ToRbusErrString(rbus_err));
         err = USP_ERR_INTERNAL_ERROR;
         goto exit;
     }
 
     // Iterate over all returned values, copying them into the params vector
-    for (i=0; i<num_values; i++)
-    {
-        val = values[i];
-        USP_ARG_ReplaceWithHint(params, val->parameterName, val->parameterValue, i);
-    }
+    next = value;
 
+    for (i = 0; i < params->num_entries && next != NULL; i++)
+    {
+        const char* param_name = rbusProperty_GetName(next);
+        rbusValue_t param_value = rbusProperty_GetValue(next);
+        USP_ARG_ReplaceWithHint(params, (char *)param_name, rbusValue_ToString(param_value,NULL, 0), i);
+        USP_LOG_Debug("%s param_name = %s value = %s \n",__FUNCTION__,param_name, rbusValue_ToString(param_value,NULL, 0));
+        next = rbusProperty_GetNext(next);
+    }
     err = USP_ERR_OK;
 
 exit:
     // Clean up
-    free_parameterValStruct_t(bus_handle, num_values, values);
+    rbusProperty_Release(value);
     USP_FREE(paths);
 
     return err;
@@ -1441,66 +1395,33 @@ exit:
 int RDK_SetGroup(int group_id, kv_vector_t *params, unsigned *param_types, int *failure_index)
 {
     int i;
-    int ccsp_err;
-    rdk_component_t *rdkc;
-    parameterValStruct_t *rdk_params;
-    parameterValStruct_t *pvs;
+    int rbus_err;
     int err = USP_ERR_OK;
-    char *fault_param = NULL;
+    rbusValue_t rbus_val;
     kv_pair_t *kv;
-    CCSP_MESSAGE_BUS_INFO *bus_info = (CCSP_MESSAGE_BUS_INFO *)bus_handle;
+    char *s = NULL;
 
     // Exit if this function is called before D-Bus has been connected to
     if (bus_handle == NULL)
     {
-        USP_ERR_SetMessage("%s: called before connected to D-Bus", __FUNCTION__);
+        USP_ERR_SetMessage("%s: called before connected to R-Bus", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
     // Form the rdk_params structure to pass to CcspBaseIf_setParameterValues()
-    rdkc = &rdk_components[group_id];
-    rdk_params = USP_MALLOC(params->num_entries * sizeof(parameterValStruct_t));
     for (i=0; i < params->num_entries; i++)
     {
-        pvs = &rdk_params[i];
         kv = &params->vector[i];
-        pvs->parameterName = kv->key;
-        pvs->parameterValue = kv->value;
-        pvs->type = UspTypeToRdkType(param_types[i]);
-    }
+	rbusValue_Init(&rbus_val);
+	s=kv->key;
+	rbusValue_SetString(rbus_val, kv->value);
+	rbus_err = rbus_set(bus_handle,s,rbus_val, NULL);
 
-    // Exit if unable to set the parameters, logging the first parameter that caused the fault
-    #define RDK_COMMIT_NOW 1
-    ccsp_err = CcspBaseIf_setParameterValues(bus_handle, rdkc->component_name, rdkc->dbus_path, 
-                                           RDK_SESSION_ID, CCSP_USP_WRITE_ID,
-                                           rdk_params, params->num_entries,
-                                           RDK_COMMIT_NOW, &fault_param);
-    if (ccsp_err != CCSP_SUCCESS)
-    {
-        // Exit if no parameter indicated by RDK
-        err = USP_ERR_SET_FAILURE;
-        if (fault_param == NULL)
-        {
-            USP_ERR_SetMessage("%s: CcspBaseIf_setParameterValues() failed (%d - %s)", __FUNCTION__, ccsp_err, ToCcspErrString(ccsp_err));
-        }
-        else
-        {
-            // If the code gets here, then a parameter was indicated by RDK
-            USP_ERR_SetMessage("%s: CcspBaseIf_setParameterValues(%s) failed (%d - %s)", __FUNCTION__, fault_param, ccsp_err, ToCcspErrString(ccsp_err));
-    
-            // Determine the index of the failed parameter in the parameters we were attempting to set
-            for (i=0; i < params->num_entries; i++)
-            {
-                kv = &params->vector[i];
-                if (strcmp(kv->key, fault_param)==0)
-                {
-                    *failure_index = i;
-                    break;
-                }
-            }
 
-            // Free the RDK allocated fault parameter string, now that we have finished with it
-            bus_info->freefunc(fault_param);
+	if (rbus_err != RBUS_ERROR_SUCCESS)
+	{
+            err = USP_ERR_SET_FAILURE;
+            USP_ERR_SetMessage("%s: rbus_set() failed (%d - %s)", __FUNCTION__, rbus_err, ToRbusErrString(rbus_err));
         }
 
         goto exit;
@@ -1508,7 +1429,7 @@ int RDK_SetGroup(int group_id, kv_vector_t *params, unsigned *param_types, int *
 
 exit:
     // Clean up
-    USP_FREE(rdk_params);
+    rbusValue_Release(rbus_val);
 
     return err;
 }
@@ -1531,41 +1452,35 @@ exit:
 **************************************************************************/
 int RDK_RefreshInstances(int group_id, char *path, int *expiry_period)
 {
-    int i;
-    int ccsp_err;
+    int rbus_err;
     int err;
-    parameterInfoStruct_t **param_infos = NULL;
-    parameterInfoStruct_t *param_info;
-    int num_param_infos = 0;
-    rdk_component_t *rdkc;
     char *name;
     int len;
 
     // Exit if this function is called before D-Bus has been connected to
     if (bus_handle == NULL)
     {
-        USP_ERR_SetMessage("%s: called before connected to D-Bus", __FUNCTION__);
+        USP_ERR_SetMessage("%s: called before connected to R-Bus", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
+    rbusElementInfo_t* elems = NULL;
+    rbus_err = rbusElementInfo_get(bus_handle,path, RBUS_MAX_NAME_DEPTH, &elems);
 
     // Exit if unable to determine all instances provided by this rdk component
-    rdkc = &rdk_components[group_id];
-
-    ccsp_err = CcspBaseIf_getParameterNames(bus_handle, rdkc->component_name, rdkc->dbus_path, path, 0, 
-                                          &num_param_infos, &param_infos);
-    if (ccsp_err != CCSP_SUCCESS)
+    if (rbus_err != RBUS_ERROR_SUCCESS)
     {
         // NOTE: getParameterNames may fail if the table has 0 entries, so just log a warning for this
-        USP_LOG_Warning("%s: CcspBaseIf_getParameterNames(%s) failed (%d- %s). Returning 0 instances for this object.", __FUNCTION__, path, ccsp_err, ToCcspErrString(ccsp_err));
+        USP_LOG_Warning("%s: rbusElementInfo_get(%s) failed (%d- %s). Returning 0 instances for this object.", __FUNCTION__, path, rbus_err, ToRbusErrString(rbus_err));
         *expiry_period = 30;
         return USP_ERR_OK;
     }
 
     // Iterate over all parameters and objects found
-    for (i=0; i<num_param_infos; i++)
+    rbusElementInfo_t* elem;
+    elem = elems;
+    while(elem)
     {
-        param_info = param_infos[i];
-        name = param_info->parameterName;
+        name = (char *)elem->name;
         len = strlen(name);
 
         // If this is an object instance, then refresh it in the data model
@@ -1573,14 +1488,15 @@ int RDK_RefreshInstances(int group_id, char *path, int *expiry_period)
         {
             USP_DM_RefreshInstance(name);
         }
+        elem = elem->next;
     }
 
     // If the code gets here, then all object instances were successfully added to the data model
     err = USP_ERR_OK;
     *expiry_period = 30;
 
-    // Free the CcspBaseIf allocated structure, as we have finished with it
-    free_parameterInfoStruct_t(bus_handle, num_param_infos, param_infos);
+    // Free the rbusElementInfo_get allocated structure, as we have finished with it
+    rbusElementInfo_free(bus_handle, elems);
     return err;
 }
 
@@ -1639,26 +1555,25 @@ int RDK_FactoryReset(void)
 **************************************************************************/
 int RdkResetInner(char *group_name, char *path, char *value, char *debug_msg)
 {
-    int ccsp_err;
+    int rbus_err;
     int group_id;
-    rdk_component_t *rdkc;
-    parameterValStruct_t rdk_param;
-    char *fault_param = NULL;
-
-    USP_ASSERT(bus_handle == NULL); // Because CCSP_USP_PA_Stop() is called before performing a reboot/factory reset
+    if((strcmp(debug_msg, "Reboot")==0) || (strcmp(debug_msg, "Factory Reset")==0))
+    {
+           USP_ASSERT(bus_handle == NULL); // Because CCSP_USP_PA_Stop() is called before performing a reboot/factory reset
+    }
 
     // Exit if unable to re-connect to the RDK message bus
-    ccsp_err = CCSP_Message_Bus_Init((char*)USPPA_COMPONENT_NAME, (char*)CONF_FILENAME, &bus_handle, malloc, free);
-    if (ccsp_err != 0)
+    rbus_err = rbus_open(&bus_handle,(char*)USPPA_COMPONENT_NAME);
+    if (rbus_err != 0)
     {
-        USP_ERR_SetMessage("%s: CCSP_Message_Bus_Init() failed (%d - %s)", __FUNCTION__, ccsp_err, ToCcspErrString(ccsp_err));
+        USP_ERR_SetMessage("%s: rbus_open() failed (%d - %s)", __FUNCTION__, rbus_err, ToRbusErrString(rbus_err));
         return USP_ERR_INTERNAL_ERROR;
     }
 
     // Exit if this function is called before D-Bus has been connected to
     if (bus_handle == NULL)
     {
-        USP_ERR_SetMessage("%s: called before connected to D-Bus", __FUNCTION__);
+        USP_ERR_SetMessage("%s: called before connected to R-Bus", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
@@ -1670,25 +1585,25 @@ int RdkResetInner(char *group_name, char *path, char *value, char *debug_msg)
     }
 
     // Fill in the details of the parameter controlling reboot or factory reset
-    rdk_param.parameterName = path;
-    rdk_param.parameterValue = value;
-    rdk_param.type = ccsp_string;
+    rbusValue_t val ;
+    rbusValue_Init(&val);
+    rbusValue_SetString(val, value);
 
     // Exit if unable to set the parameter
-    rdkc = &rdk_components[group_id];
-    ccsp_err = CcspBaseIf_setParameterValues(bus_handle, rdkc->component_name, rdkc->dbus_path, 
-                                             RDK_SESSION_ID, CCSP_USP_WRITE_ID,
-                                             &rdk_param, 1,
-                                             RDK_COMMIT_NOW, &fault_param);
-    if (ccsp_err != CCSP_SUCCESS)
+    rbus_err =rbus_set(bus_handle, path, val, NULL);
+    if (rbus_err != RBUS_ERROR_SUCCESS)
     {
-        USP_ERR_SetMessage("%s: CcspBaseIf_setParameterValues(%s) failed (%d - %s)", __FUNCTION__, path, ccsp_err, ToCcspErrString(ccsp_err));
+        USP_ERR_SetMessage("%s:rbus_set(%s) failed (%d - %s)", __FUNCTION__, path, rbus_err, ToRbusErrString(rbus_err));
         return USP_ERR_INTERNAL_ERROR;
     }
 
     // USP Agent exits
     USP_LOG_Info("%s: Performing %s", __FUNCTION__, debug_msg);
-    exit(0);
+    rbusValue_Release(val);
+    if((strcmp(debug_msg, "Reboot")==0) || (strcmp(debug_msg, "Factory Reset")==0))
+         exit(0);
+
+    return 0;
 }
 
 /*********************************************************************//**
@@ -1704,11 +1619,7 @@ int RdkResetInner(char *group_name, char *path, char *value, char *debug_msg)
 **************************************************************************/
 int DiscoverDM_Components(char *comps_filename)
 {
-    int i;
-    int ccsp_err;
-    componentStruct_t **components = NULL;
-    int num_components = 0;
-    componentStruct_t *comp;
+    int rbus_err;
     kv_vector_t found_comps;
     char *group_name;
     char buf[256];
@@ -1718,26 +1629,24 @@ int DiscoverDM_Components(char *comps_filename)
 
     // Exit if unable to discover all provider components
     #define SUBSYSTEM_PREFIX "eRT."
-    ccsp_err = CcspBaseIf_discComponentSupportingNamespace(bus_handle,
-                                                           SUBSYSTEM_PREFIX "com.cisco.spvtg.ccsp.CR",
-                                                           "Device.",
-                                                           SUBSYSTEM_PREFIX,
-                                                           &components, &num_components);
-    if (ccsp_err != CCSP_SUCCESS)
+    char **compName = 0;
+    int num = 0;
+    rbus_err = rbus_discoverElementObjects("Device.", &num, &compName);
+    if (rbus_err != RBUSCORE_SUCCESS)
     {
-        USP_ERR_SetMessage("%s: CcspBaseIf_discComponentSupportingNamespace() failed (%d - %s)", __FUNCTION__, ccsp_err, ToCcspErrString(ccsp_err));
+        USP_ERR_SetMessage("%s: rbus_discoverElementObjects failed (%d - %s)", __FUNCTION__, rbus_err, ToRbusErrString(rbus_err));
         return USP_ERR_INTERNAL_ERROR;
     }
 
     // Iterate over all components found, adding them to the kv vector
-    for (i=0; i<num_components; i++)
+    for (int i=0; i<num; i++)
     {
+        USP_LOG_Debug("%s compName = %s \n",__FUNCTION__,compName[i]);
         // Extract a short group_name
-        comp = components[i];
-        group_name = strrchr(comp->componentName, '.');
+        group_name = strrchr(compName[i], '.');
         if (group_name != NULL)
         {
-            USP_SNPRINTF(buf, sizeof(buf), "%s %s", comp->componentName, comp->dbusPath);
+            USP_SNPRINTF(buf, sizeof(buf), "%s %s", compName[i],compName[i]);
             group_name++;                       // Skip after the '.'
             USP_ARG_Add(&found_comps, group_name, buf);
         }
@@ -1753,7 +1662,6 @@ int DiscoverDM_Components(char *comps_filename)
     err = USP_ERR_OK;
 
 exit:
-    free_componentStruct_t(bus_handle, num_components, components);
     USP_ARG_Destroy(&found_comps);
 
     return USP_ERR_OK;
@@ -1773,9 +1681,7 @@ exit:
 **************************************************************************/
 int DiscoverDM_ForAllComponents(char *objs_filename, char *params_filename)
 {
-    int i;
     int err;
-    rdk_component_t *rdkc;
     kv_vector_t rdk_objects;
     kv_vector_t rdk_params;
     kv_vector_t rdk_missing_objs;
@@ -1783,7 +1689,7 @@ int DiscoverDM_ForAllComponents(char *objs_filename, char *params_filename)
     // Exit if this function is called before D-Bus has been connected to
     if (bus_handle == NULL)
     {
-        USP_ERR_SetMessage("%s: called before connected to D-Bus", __FUNCTION__);
+        USP_ERR_SetMessage("%s: called before connected to R-Bus", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
@@ -1792,12 +1698,7 @@ int DiscoverDM_ForAllComponents(char *objs_filename, char *params_filename)
     USP_ARG_Init(&rdk_params);
     USP_ARG_Init(&rdk_missing_objs);
 
-    // Iterate over all RDK components, discovering the parameters and objects that they provide
-    for (i=0; i<num_rdk_components; i++)
-    {
-        rdkc = &rdk_components[i];
-        (void)DiscoverDM_ForComponent(rdkc, &rdk_objects, &rdk_params);  // Intentionally ignoring any errors
-    }
+    DiscoverDM_ForComponent(&rdk_objects, &rdk_params);  // Intentionally ignoring any errors
 
     // Determine all table objects which do not currently have any instances, but do have a 'NumberOfEntries' parameter
     AddMissingObjs(&rdk_objects, &rdk_params, &rdk_missing_objs);
@@ -1834,39 +1735,46 @@ exit:
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int DiscoverDM_ForComponent(rdk_component_t *rdkc, kv_vector_t *rdk_objects, kv_vector_t *rdk_params)
+int DiscoverDM_ForComponent(kv_vector_t *rdk_objects, kv_vector_t *rdk_params)
 {
-    int i;
-    int ccsp_err;
+    int rbus_err;
     int err;
-    parameterInfoStruct_t **param_infos = NULL;
-    parameterInfoStruct_t *param_info;
-    int num_param_infos = 0;
     char *write_status;
+    rbusElementInfo_t* elem;
+    const char *component, *c1;
 
     // Exit if unable to determine all instances provided by this rdk component
-    USP_LOG_Info("%s: Getting parameters and objects for '%s'", __FUNCTION__, rdkc->group_name);
-    ccsp_err = CcspBaseIf_getParameterNames(bus_handle, rdkc->component_name, rdkc->dbus_path, "Device.", 0, 
-                                          &num_param_infos, &param_infos);
-    if (ccsp_err != CCSP_SUCCESS)
+    USP_LOG_Info("%s: Getting parameters and objects for CCSP components using rbus", __FUNCTION__);
+    rbusElementInfo_t* elems = NULL;
+    rbus_err = rbusElementInfo_get(bus_handle,"Device.", RBUS_MAX_NAME_DEPTH, &elems);
+    if (rbus_err != RBUS_ERROR_SUCCESS)
     {
-        USP_LOG_Error("%s: CcspBaseIf_getParameterNames(%s) failed (%d- %s)", __FUNCTION__, rdkc->group_name, ccsp_err, ToCcspErrString(ccsp_err));
-        return USP_ERR_INTERNAL_ERROR;
+       USP_LOG_Error("%s: rbusElementInfo_get(%s) failed (%d- %s)", __FUNCTION__, elems->name, rbus_err, ToRbusErrString(rbus_err));
+       return USP_ERR_INTERNAL_ERROR;
     }
 
     // Iterate over all parameters and objects found
-    for (i=0; i<num_param_infos; i++)
+    elem = elems;
+    component = NULL;
+    char* component_name = NULL;
+    while(elem)
     {
-        param_info = param_infos[i];
-        write_status = (param_info->writable) ? "RW" : "RO";
-        Add_NameToDM(rdkc, param_info->parameterName, write_status, rdk_objects, rdk_params);
+        component = elem->component;
+	c1 = NULL;
+        write_status = (elem->type == RBUS_ELEMENT_TYPE_TABLE ? elem->access & RBUS_ACCESS_ADDROW : elem->access & RBUS_ACCESS_SET)  ? "RW" : "RO";
+        if ((component_name = strrchr(component, '.')))
+              c1 =  component_name+1;
+        if(c1)
+        {
+             Add_NameToDM(c1, (char *)elem->name, write_status, rdk_objects, rdk_params);
+        }
+        elem = elem->next;
     }
-
     // If the code gets here, then all object instances were successfully added to the data model
     err = USP_ERR_OK;
 
-    // Free the CcspBaseIf allocated structure, as we have finished with it
-    free_parameterInfoStruct_t(bus_handle, num_param_infos, param_infos);
+    // Free the rbusElementInfo_get allocated structure, as we have finished with it
+    rbusElementInfo_free(bus_handle, elems);
     return err;
 }
 
@@ -1885,7 +1793,7 @@ int DiscoverDM_ForComponent(rdk_component_t *rdkc, kv_vector_t *rdk_objects, kv_
 ** \return  None
 **
 **************************************************************************/
-void Add_NameToDM(rdk_component_t *rdkc, char *instantiated_path, char *write_status, kv_vector_t *rdk_objects, kv_vector_t *rdk_params)
+void Add_NameToDM(const char *group, char *instantiated_path, char *write_status, kv_vector_t *rdk_objects, kv_vector_t *rdk_params)
 {
     char schema_path[MAX_DM_PATH];
     int len;
@@ -1905,13 +1813,13 @@ void Add_NameToDM(rdk_component_t *rdkc, char *instantiated_path, char *write_st
         if (strcmp(&schema_path[len-4], "{i}.")==0)
         {
             schema_path[len-1] = '\0';      // Drop trailing dot
-            Add_ObjectToDM(rdkc, schema_path, write_status, rdk_objects);
+            Add_ObjectToDM(group, schema_path, write_status, rdk_objects);
         }
     }
     else
     {
         // Must be a parameter
-        Add_ParamToDM(rdkc, instantiated_path, schema_path, write_status, rdk_params);
+        Add_ParamToDM(group, instantiated_path, schema_path, write_status, rdk_params);
     }
 }
 
@@ -1929,7 +1837,7 @@ void Add_NameToDM(rdk_component_t *rdkc, char *instantiated_path, char *write_st
 ** \return  None
 **
 **************************************************************************/
-void Add_ObjectToDM(rdk_component_t *rdkc, char *schema_path, char *write_status, kv_vector_t *rdk_objects)
+void Add_ObjectToDM(const char *group, char *schema_path, char *write_status, kv_vector_t *rdk_objects)
 {
     char *is_exist;
     char buf[128];
@@ -1942,7 +1850,8 @@ void Add_ObjectToDM(rdk_component_t *rdkc, char *schema_path, char *write_status
     }
 
     // Add object
-    USP_SNPRINTF(buf, sizeof(buf), "%s %s", rdkc->group_name, write_status);
+
+    USP_SNPRINTF(buf, sizeof(buf), "%s %s", group, write_status);
     USP_ARG_Add(rdk_objects, schema_path, buf);
 }
 
@@ -1961,17 +1870,16 @@ void Add_ObjectToDM(rdk_component_t *rdkc, char *schema_path, char *write_status
 ** \return  None
 **
 **************************************************************************/
-void Add_ParamToDM(rdk_component_t *rdkc, char *instantiated_path, char *schema_path, char *write_status, kv_vector_t *rdk_params)
+void Add_ParamToDM(const char *group, char *instantiated_path, char *schema_path, char *write_status, kv_vector_t *rdk_params)
 {
-    int ccsp_err;
+    int rbus_err;
+    rbusProperty_t values;
+    rbusProperty_t val;
     int num_values = 0;
-    parameterValStruct_t **values = NULL;
-    parameterValStruct_t *val;
     char *type_str;
     char *is_exist;
     char buf[128];
     char *p;
-
     // Iterate over the path, checking that all occurrences of the instance separator are correctly specified
     p = schema_path;
     while (p != NULL)
@@ -1993,7 +1901,6 @@ void Add_ParamToDM(rdk_component_t *rdkc, char *instantiated_path, char *schema_
         // Skip '{' character
         p++;
     }
-
     // Exit if param already exists
     is_exist = USP_ARG_Get(rdk_params, schema_path, NULL);
     if (is_exist != NULL)
@@ -2002,24 +1909,27 @@ void Add_ParamToDM(rdk_component_t *rdkc, char *instantiated_path, char *schema_
     }
 
     // Exit if unable to get the parameter in order to determine its type (and also check that it is readable)
-    ccsp_err = CcspBaseIf_getParameterValues(bus_handle, rdkc->component_name, rdkc->dbus_path, &instantiated_path, 1, &num_values, &values);
-    if (ccsp_err != CCSP_SUCCESS)
+     rbus_err =rbus_getExt(bus_handle, 1,(const char**)&instantiated_path, &num_values, &values);
+
+    if (rbus_err != RBUS_ERROR_SUCCESS)
     {
-        USP_LOG_Error("%s: CcspBaseIf_getParameterValues() failed (%d - %s)", __FUNCTION__, ccsp_err, ToCcspErrString(ccsp_err));
-        USP_LOG_Error("%s: WARNING: Not adding %s to the data model", __FUNCTION__, schema_path);
+        USP_LOG_Error("%s: rbus_get() failed (%d - %s)", __FUNCTION__, rbus_err, ToRbusErrString(rbus_err));
+        USP_LOG_Error("%s: WARNING: Not adding %s to the data model %s", __FUNCTION__, schema_path,instantiated_path );
         return;
     }
-
     // Determine its type (as a string)
-    val = values[0];
-    type_str = RdkTypeToTypeString(val->type);
-
+    val = values;
+    rbusValueType_t type = RBUS_NONE;
+    type = rbusValue_GetType(rbusProperty_GetValue(val));
+    type_str = RdkTypeToTypeString(type);
+    const char* param_name = rbusProperty_GetName(val);
+    rbusValue_t param_value = rbusProperty_GetValue(val);
+    USP_LOG_Debug("%s num_values = %d name  = %s values = %s \n",__FUNCTION__,num_values,param_name, rbusValue_ToString(param_value,NULL, 0));
     // Add param
-    USP_SNPRINTF(buf, sizeof(buf), "%s %s %s", rdkc->group_name, type_str, write_status);
+    USP_SNPRINTF(buf, sizeof(buf), "%s %s %s", group, type_str, write_status);
     USP_ARG_Add(rdk_params, schema_path, buf);
-
-    // Free data structure returned by CcspBaseIf_getParameterValues()
-    free_parameterValStruct_t(bus_handle, num_values, values);
+    // Free data structure returned by rbus_get()
+    rbusProperty_Release(values);
 }
 
 /*********************************************************************//**
